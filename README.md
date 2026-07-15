@@ -5,7 +5,8 @@ A small, config-driven reverse proxy in a single Go file. It maps an incoming
 the routing table whenever the config file changes — no restart needed.
 
 Built on [`moonrhythm/parapet`](https://github.com/moonrhythm/parapet) (frontend +
-graceful shutdown) and its ingress-controller `proxy` package (the reverse proxy).
+graceful shutdown); the reverse proxy is the standard library's
+`net/http/httputil.ReverseProxy` over a tuned `http.Transport`.
 
 ## Install
 
@@ -52,8 +53,10 @@ Routes live in a JSON file that is polled for changes and hot-reloaded:
 | `upstream` | Target URL. A scheme-less value (`backend:8080`) is treated as `host[:port][/path]`.|
 
 Host-specific routes take precedence over the wildcard, and longer prefixes take
-precedence over shorter ones. The upstream path prefix is preserved — the backend
-receives the original request path.
+precedence over shorter ones. If the `upstream` URL carries a base path (e.g.
+`http://backend/app`), it is prepended to the incoming request path — so `/page`
+reaches the backend as `/app/page`. Upstreams without a path receive the request
+path as-is.
 
 ## How it works
 
@@ -69,7 +72,8 @@ The whole app is one file (`main.go`).
   is served directly instead of redirected; root `/` registers the subtree only.
 - **Per-request rewrite** — the handler points `r.Host` / `r.URL.Host` (and scheme)
   at the upstream so platforms that route by the Host header reach the right
-  backend. The path (including its prefix) is left untouched. `r.RemoteAddr` is
+  backend. If the upstream carries a base path it is prepended to the request path
+  (`/page` → `/app/page`); otherwise the path is untouched. `r.RemoteAddr` is
   cleared so the proxy doesn't append the client IP to `X-Forwarded-For`.
 - **Hot reload** — a watcher polls the config file's mtime and rebuilds the table
   on change. `reload` recovers from panics (e.g. a duplicate mux pattern from a bad
