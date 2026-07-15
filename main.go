@@ -10,6 +10,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -210,15 +211,30 @@ func (ctrl *controller) reload(routes []Route) (err error) {
 			ctrl.proxy.ServeHTTP(w, r)
 		})
 
-		src := r.Host + strings.TrimSuffix(r.Prefix, "/")
-
-		// always register route as path prefix not exact match
-		if r.Prefix != "/" {
-			mux.Handle(src, handler) // exact bare path
+		// One route answers under several prefix variants, all proxying to the
+		// same upstream: the prefix as written, its lowercase form, and the last
+		// path segment of the upstream URL (e.g. ".../app" -> "/app").
+		variants := []string{r.Prefix, strings.ToLower(r.Prefix)}
+		if seg := path.Base(suffix); seg != "" && seg != "/" && seg != "." {
+			variants = append(variants, "/"+seg)
 		}
-		src += "/" // subtree
-		mux.Handle(src, handler)
-		slog.Debug("register route", "host", r.Host, "prefix", r.Prefix, "upstream", r.Upstream, "src", src)
+
+		// Register each variant once as both bare path and subtree; dedupe so a
+		// prefix that already equals a variant isn't registered twice.
+		seen := make(map[string]bool)
+		for _, prefix := range variants {
+			if seen[prefix] {
+				continue
+			}
+			seen[prefix] = true
+
+			src := r.Host + strings.TrimSuffix(prefix, "/")
+			if prefix != "/" {
+				mux.Handle(src, handler) // exact bare path
+			}
+			mux.Handle(src+"/", handler) // subtree
+			slog.Debug("register route", "host", r.Host, "prefix", prefix, "upstream", r.Upstream, "src", src)
+		}
 	}
 	ctrl.routes.Store(&routeTable{mux: mux})
 	slog.Debug("reload done", "routes", len(routes))

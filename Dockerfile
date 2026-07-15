@@ -1,21 +1,28 @@
 # syntax=docker/dockerfile:1
 
 # --- build ---
-FROM golang:1.26-alpine AS build
+# Runs on the native builder platform and cross-compiles to the target, avoiding
+# slow emulation under buildx.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
 
-# Cache modules separately from source.
+# Cache modules separately from source; the cache mount persists across builds.
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY . .
-# Static binary, no cgo, stripped.
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /generalproxy .
+# Static binary, no cgo, stripped, reproducible; cross-compiled to the target.
+ARG TARGETOS TARGETARCH
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /generalproxy .
 
 # --- run ---
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
-COPY --from=build /generalproxy /usr/local/bin/generalproxy
+# distroless/static bundles CA certs (needed for HTTPS upstreams); :nonroot runs
+# as an unprivileged user. No shell, so debug with `docker run --entrypoint`.
+FROM gcr.io/distroless/static:nonroot
+COPY --from=build --link /generalproxy /usr/local/bin/generalproxy
 
 WORKDIR /app
 EXPOSE 8080
