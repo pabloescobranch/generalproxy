@@ -7,14 +7,15 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/moonrhythm/parapet"
-	"github.com/moonrhythm/parapet-ingress-controller/proxy"
 )
 
 func main() {
@@ -116,7 +117,7 @@ func loadConfig(path string) (*Config, error) {
 // struct lets the whole table be replaced in a single store, and leaves room to
 // add fields to it later without changing the swap mechanism.
 type controller struct {
-	proxy  *proxy.Proxy
+	proxy  *httputil.ReverseProxy
 	routes atomic.Pointer[routeTable]
 }
 
@@ -125,8 +126,23 @@ type routeTable struct {
 }
 
 func newController(routes []Route) (*controller, error) {
+	// Clone keeps the stdlib dial/handshake timeouts + keepalive; we only tune
+	// the ingress→ingress hop: warm per-host pool, pass encoded bodies through,
+	// patient header timeout for slow upstream backends. TLS verification stays on.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConnsPerHost = 100
+	tr.IdleConnTimeout = 90 * time.Second
+	tr.DisableCompression = true
+	tr.ResponseHeaderTimeout = 3 * time.Minute
+
 	ctrl := &controller{
-		proxy: proxy.New(),
+		// The per-route handler sets r.URL fully before delegating, so the
+		// Director has nothing to do — but it must be non-nil or ServeHTTP panics.
+		proxy: &httputil.ReverseProxy{
+			Director:   func(*http.Request) {},
+			BufferPool: newBufferPool(),
+			Transport:  tr,
+		},
 	}
 	// init empty mux
 	ctrl.routes.Store(&routeTable{mux: http.NewServeMux()})
@@ -180,13 +196,17 @@ func (ctrl *controller) reload(routes []Route) (err error) {
 		if err != nil {
 			return err
 		}
-		scheme, host := u.Scheme, u.Host
+		scheme, host, suffix := u.Scheme, u.Host, u.Path
 
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			r.RemoteAddr = ""
 			r.Host = host         // route by upstream host, not the incoming public host
 			r.URL.Scheme = scheme // route by upstream scheme; "" is fine, the proxy treats it as http
 			r.URL.Host = host
+			// preserve the original suffix of the upstream URL, if any, so a route like "/3" -> "http://upstream/3" works
+			if suffix != "" && !strings.HasPrefix(r.URL.Path, suffix) {
+				r.URL.Path = suffix + r.URL.Path
+			}
 			ctrl.proxy.ServeHTTP(w, r)
 		})
 
@@ -244,4 +264,26 @@ func (ctrl *controller) watchConfig(ctx context.Context, path string, interval t
 		lastMod = fi.ModTime()
 		slog.Info("config reloaded", "routes", len(c.Routes))
 	}
+}
+
+const bufferSize = 16 * 1024
+
+type bufferPool struct {
+	sync.Pool
+}
+
+func newBufferPool() *bufferPool {
+	return &bufferPool{
+		Pool: sync.Pool{
+			New: func() any { return make([]byte, bufferSize) },
+		},
+	}
+}
+
+func (p *bufferPool) Get() []byte {
+	return p.Pool.Get().([]byte)
+}
+
+func (p *bufferPool) Put(b []byte) {
+	p.Pool.Put(b)
 }
