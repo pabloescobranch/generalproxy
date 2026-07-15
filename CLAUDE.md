@@ -5,6 +5,10 @@ an `upstream` URL and forwards the request, hot-reloading the routing table when
 the config file changes. Built on `moonrhythm/parapet` (frontend + graceful
 shutdown) and its ingress-controller `proxy` package (the actual reverse proxy).
 
+This file also serves as a **reference for building another custom proxy** from
+the same skeleton — see [Reusable skeleton](#reusable-skeleton) and
+[Building a variant proxy](#building-a-variant-proxy).
+
 ## Layout
 
 The whole app is one file:
@@ -51,6 +55,47 @@ go run . -config config.json -port 8080 [-debug]
 ```
 
 `-debug` logs each `host+prefix → upstream` registration on startup and reload.
+
+## Reusable skeleton
+
+The parts below are proxy-agnostic — copy them as-is into a new proxy and only
+change the routing/rewrite logic.
+
+- **`main`** — parse flags, `loadConfig`, `newController`, wire a
+  `parapet.NewFrontend()` with `s.Addr`, `s.Use(ctrl)`, `s.RegisterOnShutdown(cancel)`,
+  then `go ctrl.watchConfig(...)` and `s.ListenAndServe()`.
+- **`controller` + `atomic.Pointer[routeTable]`** — the hot-swap mechanism. A
+  request does `ctrl.routes.Load()` and serves against an immutable table; `reload`
+  builds a fresh table off to the side and flips the pointer in one store. No
+  locks, no half-swapped state. `routeTable` is a struct (not a bare `http.Handler`)
+  so you can add fields later without touching the swap.
+- **`ServeHandler(next http.Handler) http.Handler`** — the `parapet.Middleware`
+  contract. Wrap the served table in a `defer recover()` so one bad request can't
+  kill the process (client gets a 500).
+- **`watchConfig`** — mtime-poll loop with `ctx` cancellation and a `time.Ticker`.
+  Every reload error is logged and swallowed; the current table keeps serving.
+- **`reload` with `defer recover()`** — never panics out; any config-shape error
+  becomes a returned/logged error.
+
+The **proxy-specific** parts you'd replace: the `Route`/`Config` shape, the mux
+build inside `reload` (registration + per-request rewrite), and the normalization
+in `loadConfig`.
+
+## Building a variant proxy
+
+1. Copy `main.go`; keep `main`, `controller`, `routeTable`, `ServeHandler`,
+   `watchConfig`, and the `reload` panic-recover wrapper unchanged.
+2. Redefine `Route`/`Config` for the new matching dimension (e.g. header, method,
+   query param, weighted upstreams) and adjust `loadConfig` normalization.
+3. Rewrite the loop body of `reload`: how routes register into the mux (or a
+   different matcher) and what the per-request handler rewrites before calling
+   `ctrl.proxy.ServeHTTP`. Common rewrites to add here: path stripping, header
+   injection, upstream load-balancing.
+4. If you need something other than host+path matching, swap `http.ServeMux` for
+   your own matcher inside `routeTable` — the atomic swap and everything else stays.
+
+Keep the same invariants: one shared `proxy.Proxy`, atomic table swap, reload
+never crashes, listen port fixed at startup.
 
 ## Conventions
 
